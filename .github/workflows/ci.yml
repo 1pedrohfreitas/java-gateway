@@ -94,8 +94,6 @@ jobs:
       (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
       (needs.changes.outputs.backend == 'true' || github.event_name == 'workflow_dispatch') &&
       (github.event_name != 'workflow_dispatch' || inputs.deploy_backend)
-    environment:
-      name: production
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -237,8 +235,6 @@ jobs:
     defaults:
       run:
         working-directory: frontend
-    environment:
-      name: production
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -390,8 +386,6 @@ jobs:
     needs: swarm-build
     if: |
       !cancelled() && needs.swarm-build.result == 'success'
-    environment:
-      name: production
     steps:
       - uses: actions/checkout@v4
 
