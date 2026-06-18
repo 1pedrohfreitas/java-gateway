@@ -7,33 +7,22 @@ on:
       - 'frontend/**'
       - '.github/workflows/DeployFrontend.yml'
   workflow_dispatch:
-    inputs:
-      deploy_target:
-        description: 'Target server'
-        required: true
-        type: choice
-        default: 'production'
-        options: [production]
 
 env:
   NODE_VERSION: '22'
-  SERVER_HOST: ${{ secrets.SSH_HOST || '212.85.17.130' }}
-  SERVER_USER: ${{ secrets.SSH_USER || 'root' }}
-  SERVER_PORT: ${{ secrets.SSH_PORT || '22' }}
-  DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/var/www/api-gateway-admin' }}
-  VITE_API_URL: ${{ vars.VITE_API_URL || '/api/gateway' }}
 
 jobs:
   # ============================================================
-  # Build
+  # Build & Deploy
   # ============================================================
-  build:
-    name: Build React App
+  deploy:
+    name: Build & Deploy
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: frontend
-
+    environment:
+      name: production
     steps:
       - uses: actions/checkout@v4
 
@@ -44,91 +33,60 @@ jobs:
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
+      - name: Install & Build
+        run: |
+          npm ci
+          npm run build
         env:
-          VITE_API_URL: ${{ env.VITE_API_URL }}
+          VITE_API_URL: ${{ secrets.VITE_API_URL || '/api/gateway' }}
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: admin-panel-dist
-          path: frontend/dist/
-          retention-days: 7
+      - name: Verify build output
+        run: |
+          if [ ! -f dist/index.html ]; then
+            echo "ERROR: Build failed — dist/index.html not found"
+            exit 1
+          fi
+          echo "Build size: $(du -sh dist | cut -f1)"
 
-  # ============================================================
-  # Deploy to Server
-  # ============================================================
-  deploy:
-    name: Deploy → ${{ env.SERVER_HOST }}
-    runs-on: ubuntu-latest
-    needs: build
-    environment:
-      name: production
-      url: https://${{ env.SERVER_HOST }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: admin-panel-dist
-          path: frontend/dist/
-
-      - name: Setup SSH key
+      - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p ${{ env.SERVER_PORT }} -H ${{ env.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -p ${{ secrets.SSH_PORT || '22' }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Create target directory on server
+      - name: Prepare server directory
         run: |
-          ssh -i ~/.ssh/deploy_key \
-            -p ${{ env.SERVER_PORT }} \
-            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
-            "mkdir -p ${{ env.DEPLOY_PATH }}"
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "mkdir -p /var/www/api-gateway-admin"
 
-      - name: Deploy via rsync
+      - name: Deploy static files
         run: |
           rsync -avz --delete \
-            -e "ssh -i ~/.ssh/deploy_key -p ${{ env.SERVER_PORT }}" \
-            frontend/dist/ \
-            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }}:${{ env.DEPLOY_PATH }}/
+            -e "ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }}" \
+            dist/ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/var/www/api-gateway-admin/
 
-      - name: Install nginx if needed
+      - name: Configure nginx
         run: |
-          ssh -i ~/.ssh/deploy_key \
-            -p ${{ env.SERVER_PORT }} \
-            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
-            "command -v nginx || (apt-get update -qq && apt-get install -y -qq nginx)"
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT || '22' }} \
+            ../deploy/nginx-gateway-admin.conf \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/etc/nginx/sites-available/api-gateway-admin
 
-      - name: Deploy nginx config
-        run: |
-          scp -i ~/.ssh/deploy_key \
-            -P ${{ env.SERVER_PORT }} \
-            deploy/nginx-gateway-admin.conf \
-            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }}:/etc/nginx/sites-available/api-gateway-admin
-
-          ssh -i ~/.ssh/deploy_key \
-            -p ${{ env.SERVER_PORT }} \
-            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
-            "ln -sf /etc/nginx/sites-available/api-gateway-admin /etc/nginx/sites-enabled/ && \
-             nginx -t && \
-             systemctl reload nginx || service nginx reload"
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "command -v nginx || (apt-get update -qq && apt-get install -y -qq nginx); \
+             ln -sf /etc/nginx/sites-available/api-gateway-admin /etc/nginx/sites-enabled/; \
+             nginx -t && systemctl reload nginx"
 
       - name: Verify deployment
         run: |
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://${{ env.SERVER_HOST }}/ || echo "000")
-          echo "HTTP status: $STATUS"
+          set +e
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://${{ secrets.SSH_HOST }}/ 2>/dev/null) || STATUS="000"
+          set -e
+          echo "Frontend HTTP status: $STATUS"
           if [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ] || [ "$STATUS" = "302" ]; then
-            echo "✅ Deployment OK"
+            echo "✅ Frontend deployed successfully"
           else
-            echo "⚠️  Unexpected status: $STATUS (may need a moment to start)"
+            echo "⚠️  Unexpected status: $STATUS (may need a moment to load)"
           fi
 
       - name: Cleanup SSH key

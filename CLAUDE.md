@@ -190,15 +190,26 @@ O serviço roda como usuário `api-gateway` em `/opt/api-gateway/api-gateway.jar
 | `DeployFrontend.yml` | Push `frontend/**` / Manual | Só frontend: build → rsync → nginx reload |
 | `Build.yml` | Push `main`/`develop`/tags | Docker Swarm: test → build image → push registry → deploy stack |
 
-### Secrets necessários
+**Correções aplicadas (vs versão anterior):**
+- `inputs` só existe em `workflow_dispatch`; todas as condições `if` agora verificam `github.event_name == 'push' ||` antes de acessar `inputs`
+- `environment.url` removido (não aceita `${{ env }}`)
+- `needs` com `!cancelled()` + verificação de `result`
+- `set +e`/`set -e` nos health checks que podem falhar
+
+### Secrets necessários no GitHub
 
 | Secret | Descrição |
 |--------|-----------|
-| `SSH_HOST` | `212.85.17.130` |
-| `SSH_USER` | `root` |
+| `SSH_HOST` | IP/hostname do servidor |
+| `SSH_USER` | Usuário SSH (ex: `root`) |
+| `SSH_PORT` | Porta SSH (default `22`) |
 | `SSH_PRIVATE_KEY` | Chave SSH privada para deploy |
 | `REGISTRY_USERNAME` | (Swarm) Usuário do Docker registry |
 | `REGISTRY_PASSWORD` | (Swarm) Senha do Docker registry |
+| `SWARM_STAGING_HOST` | (Swarm) Host do cluster staging |
+| `SWARM_STAGING_SSH_KEY` | (Swarm) Chave SSH staging |
+| `SWARM_PROD_HOST` | (Swarm) Host do cluster produção |
+| `SWARM_PROD_SSH_KEY` | (Swarm) Chave SSH produção |
 
 ## Atenção: API do Spring 7.0
 
