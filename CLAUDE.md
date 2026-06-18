@@ -11,10 +11,14 @@ API Gateway dinâmico com configuração de rotas em tempo de execução (banco 
 ## Comandos
 
 ```bash
-# Build & testes
+# Backend — build & testes
 ./mvnw clean test                    # Todos os testes (32 testes)
 ./mvnw test -Dtest=NomeDoTeste       # Teste específico
 ./mvnw spring-boot:run               # Executar (dev profile com H2 + seed de rotas)
+
+# Frontend — Admin Panel
+cd frontend && npm install && npm run dev   # Dev server (localhost:5173)
+cd frontend && npm run build                # Build produção → dist/
 
 # Native image (GraalVM)
 ./mvnw -Pnative native:compile       # Executável nativo
@@ -36,37 +40,48 @@ API Gateway dinâmico com configuração de rotas em tempo de execução (banco 
 ## Estrutura
 
 ```
-src/main/java/dev/pedrohfreitas/api_gateway/
-├── ApiGatewayApplication.java
-├── config/
-│   ├── GatewayConfig.java      # RestClient.Builder + ObjectMapper beans
-│   └── DevDataSeeder.java      # Rotas de exemplo (dev profile)
-├── controller/
-│   ├── GatewayController.java  # Catch-all /** — proxy para rotas configuradas
-│   └── RouteConfigController.java  # CRUD /api/gateway/routes
-├── dto/
-│   ├── RouteConfigRequest.java      # Record com validação Jakarta
-│   ├── RouteConfigResponse.java     # Record com from(RouteConfig)
-│   └── ErrorResponse.java           # Resposta de erro padronizada
-├── entity/
-│   └── RouteConfig.java       # JPA entity com campos de header JSON
-├── exception/
-│   ├── GatewayException.java        # Base (status + message)
-│   ├── RouteNotFoundException.java  # 404
-│   ├── DuplicateRouteException.java # 409
-│   ├── JwtValidationException.java  # 401
-│   ├── ProxyException.java          # 502
-│   └── GlobalExceptionHandler.java  # @RestControllerAdvice
-├── filter/
-│   └── GatewayJwtFilter.java  # OncePerRequestFilter — valida JWT em rotas protegidas
-├── repository/
-│   └── RouteConfigRepository.java
-├── security/
-│   └── JwtService.java        # Validação JWT com HMAC-SHA256
-└── service/
-    ├── RouteConfigService.java  # Cache em memória, match AntPathMatcher, CRUD
-    └── GatewayProxyService.java # Proxy via RestClient, filtro de headers
+api-gateway/
+├── pom.xml                          # Maven (Spring Boot 4.1.0)
+├── Dockerfile                       # Multi-stage build (Maven → JRE 21 Alpine)
+├── docker-compose.yml               # Dev local (PostgreSQL + Gateway)
+├── docker-stack.yml                 # Docker Swarm (secrets, replicas, rolling updates)
+├── entrypoint.sh                    # Runtime: lê secrets Docker, exporta env vars
+├── deploy/
+│   ├── swarm-setup.sh               # Setup inicial do cluster Swarm
+│   ├── deploy-frontend.sh           # Deploy manual do admin panel
+│   └── nginx-gateway-admin.conf     # Nginx config para o admin panel
+├── .github/workflows/
+│   ├── Build.yml                    # CI/CD Backend (test → build → push → deploy Swarm)
+│   └── DeployFrontend.yml           # CI/CD Frontend (build → rsync → nginx reload)
+├── frontend/                        # React Admin Panel (Vite + TypeScript)
+│   ├── src/
+│   │   ├── api/client.ts            # Axios — CRUD de rotas
+│   │   ├── pages/RouteList.tsx      # Lista com toggle, delete, busca
+│   │   ├── pages/RouteForm.tsx      # Formulário create/edit com headers JSON
+│   │   ├── components/Layout.tsx    # Sidebar + conteúdo
+│   │   ├── components/HeaderEditor.tsx  # Editor JSON para headers
+│   │   └── types/route.ts          # Tipos TypeScript
+│   └── vite.config.ts
+└── src/main/java/.../               # Backend Java (ver seção anterior)
 ```
+
+### Frontend — Admin Panel
+
+**Stack:** React 18, TypeScript, Vite, React Router 6, Axios, react-hot-toast
+
+```bash
+cd frontend
+npm install
+npm run dev          # http://localhost:5173 (proxy /api → localhost:8080)
+npm run build        # Produção → dist/
+```
+
+Rotas do painel:
+- `/routes` — Lista de rotas (busca, toggle, delete)
+- `/routes/new` — Criar nova rota (path, target, headers JSON, JWT)
+- `/routes/:id/edit` — Editar rota existente
+
+A variável `VITE_API_URL` define a URL base da API (default: `/api/gateway`).
 
 ## API de Gerenciamento
 
@@ -138,21 +153,52 @@ docker service logs api-gateway_gateway
 docker stack rm api-gateway
 ```
 
+## Deploy Direto no Servidor (`root@212.85.17.130`)
+
+### Manual
+
+```bash
+# Backend (JAR + systemd)
+SSH_KEY=~/.ssh/id_rsa ./deploy/deploy-backend.sh
+
+# Frontend (React + nginx)
+SSH_KEY=~/.ssh/id_rsa ./deploy/deploy-frontend.sh
+```
+
+### systemd Service
+
+```bash
+# Instalação inicial via script de deploy (automático)
+# Ou manual:
+scp deploy/api-gateway.service root@212.85.17.130:/etc/systemd/system/
+ssh root@212.85.17.130 "systemctl daemon-reload && systemctl enable --now api-gateway"
+
+# Gerenciar
+ssh root@212.85.17.130 systemctl status api-gateway
+ssh root@212.85.17.130 journalctl -u api-gateway -f
+ssh root@212.85.17.130 systemctl restart api-gateway
+```
+
+O serviço roda como usuário `api-gateway` em `/opt/api-gateway/api-gateway.jar`.
+
 ### CI/CD (GitHub Actions)
 
-O pipeline `.github/workflows/Build.yml` executa:
-1. **Test** — `./mvnw test` com Java 21
-2. **Build & Push** — Docker multi-arch (`linux/amd64`, `linux/arm64`) via Buildx, push para registry
-3. **Deploy Staging** — Swarm deploy automático no push para `develop`
-4. **Deploy Production** — Swarm deploy automático no push de tags `v*`
-5. **Security Scan** — Trivy scan na imagem
+| Workflow | Gatilho | Ações |
+|----------|---------|-------|
+| `Deploy.yml` | Push `main` / Manual | **Full stack**: test backend → build JAR → deploy JAR + systemd restart → build frontend → deploy static + nginx reload |
+| `DeployBackend.yml` | Push `src/**` / Manual | Só backend: test → build → deploy JAR → restart systemd |
+| `DeployFrontend.yml` | Push `frontend/**` / Manual | Só frontend: build → rsync → nginx reload |
+| `Build.yml` | Push `main`/`develop`/tags | Docker Swarm: test → build image → push registry → deploy stack |
 
-### Environments & Secrets necessários
+### Secrets necessários
 
-| Environment | Secrets |
-|-------------|---------|
-| CI/CD | `REGISTRY_USERNAME`, `REGISTRY_PASSWORD`, `SWARM_STAGING_HOST`, `SWARM_STAGING_SSH_KEY`, `SWARM_PROD_HOST`, `SWARM_PROD_SSH_KEY` |
-| Swarm | `api_gateway_db_password`, `api_gateway_db_username`, `api_gateway_jwt_secret` |
+| Secret | Descrição |
+|--------|-----------|
+| `SSH_HOST` | `212.85.17.130` |
+| `SSH_USER` | `root` |
+| `SSH_PRIVATE_KEY` | Chave SSH privada para deploy |
+| `REGISTRY_USERNAME` | (Swarm) Usuário do Docker registry |
+| `REGISTRY_PASSWORD` | (Swarm) Senha do Docker registry |
 
 ## Atenção: API do Spring 7.0
 

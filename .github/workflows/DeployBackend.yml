@@ -1,0 +1,146 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'pom.xml'
+      - '.github/workflows/DeployBackend.yml'
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests?'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  JAVA_VERSION: '21'
+  SERVER_HOST: ${{ secrets.SSH_HOST || '212.85.17.130' }}
+  SERVER_USER: ${{ secrets.SSH_USER || 'root' }}
+  SERVER_PORT: ${{ secrets.SSH_PORT || '22' }}
+  DEPLOY_PATH: ${{ vars.BACKEND_DEPLOY_PATH || '/opt/api-gateway' }}
+
+jobs:
+  # ============================================================
+  # Test
+  # ============================================================
+  test:
+    name: Test (Java ${{ env.JAVA_VERSION }})
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_tests }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run tests
+        run: ./mvnw test -B
+
+      - name: Publish test report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Backend Tests
+          path: target/surefire-reports/TEST-*.xml
+          reporter: java-junit
+
+  # ============================================================
+  # Build & Deploy
+  # ============================================================
+  deploy:
+    name: Build & Deploy → ${{ env.SERVER_HOST }}
+    runs-on: ubuntu-latest
+    needs: test
+    if: ${{ !failure() }}
+    environment:
+      name: production
+      url: https://${{ env.SERVER_HOST }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build JAR
+        run: ./mvnw clean package -DskipTests -B
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p ${{ env.SERVER_PORT }} -H ${{ env.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Prepare server
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -p ${{ env.SERVER_PORT }} \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+            "id -u api-gateway &>/dev/null || useradd -r -s /bin/false api-gateway; \
+             mkdir -p ${{ env.DEPLOY_PATH }}; \
+             chown -R api-gateway:api-gateway ${{ env.DEPLOY_PATH }}"
+
+      - name: Upload JAR
+        run: |
+          JAR_FILE=$(ls target/api-gateway-*.jar | grep -v original | head -1)
+          rsync -avz \
+            -e "ssh -i ~/.ssh/deploy_key -p ${{ env.SERVER_PORT }}" \
+            "$JAR_FILE" \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }}:${{ env.DEPLOY_PATH }}/api-gateway.jar
+
+          ssh -i ~/.ssh/deploy_key \
+            -p ${{ env.SERVER_PORT }} \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+            "chown api-gateway:api-gateway ${{ env.DEPLOY_PATH }}/api-gateway.jar"
+
+      - name: Install systemd service
+        run: |
+          scp -i ~/.ssh/deploy_key \
+            -P ${{ env.SERVER_PORT }} \
+            deploy/api-gateway.service \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }}:/etc/systemd/system/api-gateway.service
+
+          ssh -i ~/.ssh/deploy_key \
+            -p ${{ env.SERVER_PORT }} \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+            "systemctl daemon-reload && \
+             systemctl enable api-gateway && \
+             (systemctl is-active --quiet api-gateway && systemctl restart api-gateway || systemctl start api-gateway)"
+
+      - name: Verify health
+        run: |
+          echo "Waiting for startup..."
+          sleep 8
+          for i in 1 2 3 4 5; do
+            STATUS=$(ssh -i ~/.ssh/deploy_key \
+              -p ${{ env.SERVER_PORT }} \
+              ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+              "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health" 2>/dev/null || echo "000")
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Backend healthy!"
+              exit 0
+            fi
+            sleep 4
+          done
+          echo "⚠️  Health check failed after 5 attempts — checking logs:"
+          ssh -i ~/.ssh/deploy_key \
+            -p ${{ env.SERVER_PORT }} \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+            "journalctl -u api-gateway --no-pager -n 30"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

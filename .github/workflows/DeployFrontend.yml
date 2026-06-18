@@ -1,0 +1,136 @@
+name: Deploy Admin Panel
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/DeployFrontend.yml'
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: 'Target server'
+        required: true
+        type: choice
+        default: 'production'
+        options: [production]
+
+env:
+  NODE_VERSION: '22'
+  SERVER_HOST: ${{ secrets.SSH_HOST || '212.85.17.130' }}
+  SERVER_USER: ${{ secrets.SSH_USER || 'root' }}
+  SERVER_PORT: ${{ secrets.SSH_PORT || '22' }}
+  DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/var/www/api-gateway-admin' }}
+  VITE_API_URL: ${{ vars.VITE_API_URL || '/api/gateway' }}
+
+jobs:
+  # ============================================================
+  # Build
+  # ============================================================
+  build:
+    name: Build React App
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_API_URL: ${{ env.VITE_API_URL }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-panel-dist
+          path: frontend/dist/
+          retention-days: 7
+
+  # ============================================================
+  # Deploy to Server
+  # ============================================================
+  deploy:
+    name: Deploy → ${{ env.SERVER_HOST }}
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: production
+      url: https://${{ env.SERVER_HOST }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: admin-panel-dist
+          path: frontend/dist/
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p ${{ env.SERVER_PORT }} -H ${{ env.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Create target directory on server
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -p ${{ env.SERVER_PORT }} \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+            "mkdir -p ${{ env.DEPLOY_PATH }}"
+
+      - name: Deploy via rsync
+        run: |
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key -p ${{ env.SERVER_PORT }}" \
+            frontend/dist/ \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }}:${{ env.DEPLOY_PATH }}/
+
+      - name: Install nginx if needed
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -p ${{ env.SERVER_PORT }} \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+            "command -v nginx || (apt-get update -qq && apt-get install -y -qq nginx)"
+
+      - name: Deploy nginx config
+        run: |
+          scp -i ~/.ssh/deploy_key \
+            -P ${{ env.SERVER_PORT }} \
+            deploy/nginx-gateway-admin.conf \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }}:/etc/nginx/sites-available/api-gateway-admin
+
+          ssh -i ~/.ssh/deploy_key \
+            -p ${{ env.SERVER_PORT }} \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+            "ln -sf /etc/nginx/sites-available/api-gateway-admin /etc/nginx/sites-enabled/ && \
+             nginx -t && \
+             systemctl reload nginx || service nginx reload"
+
+      - name: Verify deployment
+        run: |
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://${{ env.SERVER_HOST }}/ || echo "000")
+          echo "HTTP status: $STATUS"
+          if [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ] || [ "$STATUS" = "302" ]; then
+            echo "✅ Deployment OK"
+          else
+            echo "⚠️  Unexpected status: $STATUS (may need a moment to start)"
+          fi
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

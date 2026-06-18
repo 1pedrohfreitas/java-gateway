@@ -1,0 +1,53 @@
+# systemd service — API Gateway Backend
+#
+# Install:
+#   sudo cp deploy/api-gateway.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable api-gateway
+#   sudo systemctl start api-gateway
+#
+# Manage:
+#   sudo systemctl status api-gateway
+#   sudo journalctl -u api-gateway -f
+#   sudo systemctl restart api-gateway
+
+[Unit]
+Description=API Gateway — Dynamic Route Proxy
+After=network.target postgresql.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=api-gateway
+Group=api-gateway
+WorkingDirectory=/opt/api-gateway
+ExecStart=/usr/bin/java \
+    -XX:+UseG1GC \
+    -XX:MaxGCPauseMillis=200 \
+    -Xms128m \
+    -Xmx384m \
+    -XX:+ExitOnOutOfMemoryError \
+    -jar /opt/api-gateway/api-gateway.jar
+
+# Environment
+Environment=SPRING_PROFILES_ACTIVE=prod
+Environment=DATABASE_URL=jdbc:postgresql://localhost:5432/apigateway
+Environment=DATABASE_USERNAME=apigateway
+Environment=DATABASE_PASSWORD=apigateway
+Environment=GATEWAY_JWT_SECRET=change-me-in-production-use-at-least-256-bits-key
+
+# Graceful shutdown
+SuccessExitStatus=143
+TimeoutStopSec=30
+KillMode=mixed
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=api-gateway
+
+[Install]
+WantedBy=multi-user.target
