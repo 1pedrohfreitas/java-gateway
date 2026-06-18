@@ -139,26 +139,41 @@ jobs:
 
             # Verify
             echo "=== Waiting for services ==="
-            sleep 15
             docker stack services "$REPO"
 
+            # Wait for replicas to come up (Spring Boot + JPA takes 30-60s first time)
+            echo "=== Waiting for replicas ==="
+            for i in $(seq 1 20); do
+              GATEWAY_UP=$(docker service ls --filter name="${REPO}_gateway" --format '{{.Replicas}}' | grep -E '^[1-9]/' || true)
+              FRONTEND_UP=$(docker service ls --filter name="${REPO}_frontend" --format '{{.Replicas}}' | grep -E '^[1-9]/' || true)
+              if [ -n "$GATEWAY_UP" ] && [ -n "$FRONTEND_UP" ]; then
+                echo "✅ Replicas running after $((i*5))s"
+                break
+              fi
+              sleep 5
+            done
+            docker stack services "$REPO"
+
+            # Health check
             echo "=== Health check ==="
-            for i in 1 2 3 4 5; do
+            OK=true
+            for i in $(seq 1 10); do
               STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health 2>/dev/null || echo "000")
               echo "Backend $i: HTTP $STATUS"
-              [ "$STATUS" = "200" ] && break
-              sleep 6
+              if [ "$STATUS" != "200" ]; then OK=false; fi
+              sleep 5
             done
-            for i in 1 2 3 4 5; do
+            for i in $(seq 1 10); do
               STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost/ 2>/dev/null || echo "000")
               echo "Frontend $i: HTTP $STATUS"
-              [ "$STATUS" = "200" ] && echo "✅ Deploy OK" && exit 0
-              sleep 6
+              if [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ]; then OK=true; fi
+              sleep 5
             done
+            $OK && echo "✅ Deploy OK" && exit 0
 
             echo "⚠️  Health check failed — logs:"
-            docker service logs "${REPO}_gateway" --tail 20 || true
-            docker service logs "${REPO}_frontend" --tail 20 || true
+            docker service logs "${REPO}_gateway" --tail 30 || true
+            docker service logs "${REPO}_frontend" --tail 30 || true
             exit 1
           DEPLOY
 
