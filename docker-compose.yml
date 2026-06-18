@@ -1,0 +1,46 @@
+# Docker Compose — api-gateway (local development / single-host)
+#
+# Run:
+#   docker compose up -d
+#   docker compose logs -f
+#   docker compose down
+
+version: "3.9"
+
+services:
+
+  # ---- PostgreSQL ----
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: apigateway
+      POSTGRES_USER: apigateway
+      POSTGRES_PASSWORD: apigateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apigateway"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- API Gateway ----
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: jdbc:postgresql://postgres:5432/apigateway
+      DATABASE_USERNAME: apigateway
+      DATABASE_PASSWORD: apigateway
+      GATEWAY_JWT_SECRET: local-dev-jwt-secret-at-least-32-chars
+      SPRING_PROFILES_ACTIVE: prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

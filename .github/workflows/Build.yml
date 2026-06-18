@@ -1,0 +1,175 @@
+name: Build & Deploy to Swarm
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deploy to environment'
+        required: true
+        type: choice
+        default: 'staging'
+        options: [staging, production]
+
+env:
+  REGISTRY: ${{ vars.DOCKER_REGISTRY || 'registry.example.com' }}
+  IMAGE_NAME: api-gateway
+  PLATFORMS: linux/amd64,linux/arm64
+
+# ============================================================
+# Jobs
+# ============================================================
+jobs:
+
+  # ---- Test ----
+  test:
+    name: Test (Java 21)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run tests
+        run: ./mvnw test -B
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: JUnit Tests
+          path: target/surefire-reports/TEST-*.xml
+          reporter: java-junit
+
+  # ---- Build & Push Image ----
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_full: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Login to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: ${{ env.PLATFORMS }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+  # ---- Deploy to Swarm ----
+  deploy-staging:
+    name: Deploy → Staging Swarm
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' || github.event.inputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://staging-gateway.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy stack to staging swarm
+        uses: cssnr/deploy-stack-action@v1
+        with:
+          host: ${{ secrets.SWARM_STAGING_HOST }}
+          user: ${{ secrets.SWARM_STAGING_USER }}
+          ssh_key: ${{ secrets.SWARM_STAGING_SSH_KEY }}
+          stack_file: docker-stack.yml
+          stack_name: api-gateway-staging
+          env_vars: |
+            DOCKER_REGISTRY=${{ env.REGISTRY }}
+            IMAGE_TAG=${{ needs.build.outputs.image_tag }}
+          secrets: ${{ secrets.SWARM_STAGING_SECRETS }}
+          prune: true
+          resolve_image: always
+
+  deploy-production:
+    name: Deploy → Production Swarm
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://gateway.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy stack to production swarm
+        uses: cssnr/deploy-stack-action@v1
+        with:
+          host: ${{ secrets.SWARM_PROD_HOST }}
+          user: ${{ secrets.SWARM_PROD_USER }}
+          ssh_key: ${{ secrets.SWARM_PROD_SSH_KEY }}
+          stack_file: docker-stack.yml
+          stack_name: api-gateway
+          env_vars: |
+            DOCKER_REGISTRY=${{ env.REGISTRY }}
+            IMAGE_TAG=${{ needs.build.outputs.image_tag }}
+          secrets: ${{ secrets.SWARM_PROD_SECRETS }}
+          prune: true
+          resolve_image: always
+          with_registry_auth: true
+
+  # ---- Security Scan ----
+  scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
