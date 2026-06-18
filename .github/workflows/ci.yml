@@ -118,42 +118,82 @@ jobs:
       - name: Build JAR
         run: ./mvnw clean package -DskipTests -B
 
+      # -------------------------------------------------------
+      # SSH steps — all guarded by secret presence
+      # -------------------------------------------------------
+
       - name: Setup SSH
         run: |
+          if [ -z "$HOST" ] || [ -z "$KEY" ]; then
+            echo "⚠️  SSH_HOST or SSH_PRIVATE_KEY not set — skipping SSH setup"
+            exit 0
+          fi
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          echo "$KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p ${{ secrets.SSH_PORT || '22' }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ secrets.SSH_PORT }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Prepare server
         run: |
-          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
+            echo "⚠️  Skipping — no SSH config"
+            exit 0
+          fi
+          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
             "id -u api-gateway &>/dev/null || useradd -r -s /bin/false api-gateway; \
              mkdir -p /opt/api-gateway; chown -R api-gateway:api-gateway /opt/api-gateway"
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ secrets.SSH_PORT }}
+          USER: ${{ secrets.SSH_USER }}
 
       - name: Deploy JAR
         run: |
+          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
+            echo "⚠️  Skipping — no SSH config"
+            exit 0
+          fi
           JAR_FILE=$(ls target/api-gateway-*.jar | grep -v original | head -1)
           echo "Uploading: $JAR_FILE"
-          rsync -avz -e "ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }}" \
-            "$JAR_FILE" ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/api-gateway/api-gateway.jar
+          rsync -avz -e "ssh -i ~/.ssh/deploy_key -p ${PORT:-22}" \
+            "$JAR_FILE" "${USER}@${HOST}:/opt/api-gateway/api-gateway.jar"
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ secrets.SSH_PORT }}
+          USER: ${{ secrets.SSH_USER }}
 
       - name: Update systemd & restart
         run: |
-          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT || '22' }} \
+          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
+            echo "⚠️  Skipping — no SSH config"
+            exit 0
+          fi
+          scp -i ~/.ssh/deploy_key -P "${PORT:-22}" \
             deploy/api-gateway.service \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/etc/systemd/system/api-gateway.service
-          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "${USER}@${HOST}:/etc/systemd/system/api-gateway.service"
+          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
             "chown api-gateway:api-gateway /opt/api-gateway/api-gateway.jar && \
              systemctl daemon-reload && systemctl enable api-gateway && \
              (systemctl is-active --quiet api-gateway && systemctl restart api-gateway || systemctl start api-gateway)"
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ secrets.SSH_PORT }}
+          USER: ${{ secrets.SSH_USER }}
 
       - name: Health check
         run: |
+          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
+            echo "⚠️  Skipping health check — no SSH config"
+            exit 0
+          fi
           sleep 10
           for i in 1 2 3 4 5; do
             set +e
-            STATUS=$(ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            STATUS=$(ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
               "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health" 2>/dev/null) || STATUS="000"
             set -e
             echo "Attempt $i: HTTP $STATUS"
@@ -161,8 +201,13 @@ jobs:
             sleep 4
           done
           echo "⚠️  Health check failed"
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ secrets.SSH_PORT }}
+          USER: ${{ secrets.SSH_USER }}
 
-      - if: always()
+      - name: Cleanup SSH key
+        if: always()
         run: rm -f ~/.ssh/deploy_key
 
   # ==========================================================
@@ -200,41 +245,80 @@ jobs:
 
       - name: Setup SSH
         run: |
+          if [ -z "$HOST" ] || [ -z "$KEY" ]; then
+            echo "⚠️  SSH_HOST or SSH_PRIVATE_KEY not set — skipping SSH setup"
+            exit 0
+          fi
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          echo "$KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p ${{ secrets.SSH_PORT || '22' }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ secrets.SSH_PORT }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Prepare server
         run: |
-          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
+            echo "⚠️  Skipping — no SSH config"
+            exit 0
+          fi
+          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
             "mkdir -p /var/www/api-gateway-admin"
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ secrets.SSH_PORT }}
+          USER: ${{ secrets.SSH_USER }}
 
       - name: Deploy files
         run: |
+          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
+            echo "⚠️  Skipping — no SSH config"
+            exit 0
+          fi
           rsync -avz --delete \
-            -e "ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }}" \
-            dist/ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/var/www/api-gateway-admin/
+            -e "ssh -i ~/.ssh/deploy_key -p ${PORT:-22}" \
+            dist/ "${USER}@${HOST}:/var/www/api-gateway-admin/"
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ secrets.SSH_PORT }}
+          USER: ${{ secrets.SSH_USER }}
 
       - name: Configure nginx
         run: |
-          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT || '22' }} \
+          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
+            echo "⚠️  Skipping — no SSH config"
+            exit 0
+          fi
+          scp -i ~/.ssh/deploy_key -P "${PORT:-22}" \
             ../deploy/nginx-gateway-admin.conf \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/etc/nginx/sites-available/api-gateway-admin
-          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "${USER}@${HOST}:/etc/nginx/sites-available/api-gateway-admin"
+          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
             "command -v nginx || (apt-get update -qq && apt-get install -y -qq nginx); \
              ln -sf /etc/nginx/sites-available/api-gateway-admin /etc/nginx/sites-enabled/; \
              nginx -t && systemctl reload nginx"
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ secrets.SSH_PORT }}
+          USER: ${{ secrets.SSH_USER }}
 
       - name: Verify
         run: |
+          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
+            echo "⚠️  Skipping verify — no SSH config"
+            exit 0
+          fi
           set +e
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://${{ secrets.SSH_HOST }}/ 2>/dev/null) || STATUS="000"
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://${HOST}/" 2>/dev/null) || STATUS="000"
           set -e
           echo "HTTP status: $STATUS"
           [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ] || [ "$STATUS" = "302" ] && echo "✅ Frontend OK" || echo "⚠️  Status: $STATUS"
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
 
-      - if: always()
+      - name: Cleanup SSH key
+        if: always()
         run: rm -f ~/.ssh/deploy_key
 
   # ==========================================================
@@ -297,25 +381,30 @@ jobs:
 
       - name: Deploy stack
         run: |
+          if [ -z "$HOST" ] || [ -z "$KEY" ]; then
+            echo "⚠️  SWARM_PROD_HOST or SWARM_PROD_SSH_KEY not set — skipping"
+            exit 0
+          fi
           mkdir -p ~/.ssh
-          echo "${{ secrets.SWARM_PROD_SSH_KEY }}" > ~/.ssh/swarm_key
+          echo "$KEY" > ~/.ssh/swarm_key
           chmod 600 ~/.ssh/swarm_key
-          ssh-keyscan -H ${{ secrets.SWARM_PROD_HOST }} >> ~/.ssh/known_hosts || true
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts || true
 
           export IMAGE_TAG="${{ needs.swarm-build.outputs.image_tag }}"
           export REGISTRY="${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}"
 
           scp -i ~/.ssh/swarm_key docker-stack.yml \
-            ${{ secrets.SWARM_PROD_USER }}@${{ secrets.SWARM_PROD_HOST }}:/tmp/docker-stack.yml
+            "${SSH_USER}@${HOST}:/tmp/docker-stack.yml"
 
-          ssh -i ~/.ssh/swarm_key \
-            ${{ secrets.SWARM_PROD_USER }}@${{ secrets.SWARM_PROD_HOST }} \
+          ssh -i ~/.ssh/swarm_key "${SSH_USER}@${HOST}" \
             "DOCKER_REGISTRY=${REGISTRY} IMAGE_TAG=${IMAGE_TAG} \
              docker stack deploy -c /tmp/docker-stack.yml api-gateway --prune --resolve-image always"
 
           rm -f ~/.ssh/swarm_key
         env:
-          IMAGE_TAG: ${{ needs.swarm-build.outputs.image_tag }}
+          HOST: ${{ secrets.SWARM_PROD_HOST }}
+          KEY: ${{ secrets.SWARM_PROD_SSH_KEY }}
+          SSH_USER: ${{ secrets.SWARM_PROD_USER }}
 
   # ==========================================================
   # Security Scan (on tags only)
