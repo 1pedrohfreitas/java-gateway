@@ -22,28 +22,56 @@ jobs:
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts
-          echo "PORT='$SSH_PORT'"
-          echo "PORT='$SSH_HOST'"
 
       - name: Deploy Swarm
         run: |
           REPO_NAME=$(echo "${GITHUB_REPOSITORY}" | cut -d'/' -f2)
           BRANCH="${GITHUB_REF#refs/heads/}"
+          IMAGE_TAG="${GITHUB_SHA:0:8}"
 
-          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -s "$REPO_NAME" "$BRANCH" "$IMAGE_TAG" "$GITHUB_REPOSITORY" << 'DEPLOY'
             set -e
+            REPO="$1"
+            BRANCH="$2"
+            TAG="$3"
+            GH_REPO="$4"
 
-            APP_DIR=\$HOME/deploy/$REPO_NAME
+            APP_DIR="$HOME/deploy/$REPO"
 
-            if [ ! -d \$APP_DIR ]; then
-              git clone https://github.com/${GITHUB_REPOSITORY}.git \$APP_DIR
+            if [ ! -d "$APP_DIR" ]; then
+              git clone "https://github.com/$GH_REPO.git" "$APP_DIR"
             fi
 
-            cd \$APP_DIR
-            git pull origin $BRANCH
+            cd "$APP_DIR"
+            git fetch origin
+            git checkout "$BRANCH"
+            git pull origin "$BRANCH"
 
-            docker stack deploy -c docker-stack.yml $REPO_NAME --prune --resolve-image always
-          "
+            echo "=== Building image: $REPO:$TAG ==="
+            docker build -t "$REPO:$TAG" .
+
+            echo "=== Deploying stack ==="
+            IMAGE_NAME="$REPO" IMAGE_TAG="$TAG" \
+              docker stack deploy -c docker-stack.yml "$REPO" --prune --resolve-image always
+
+            echo "=== Waiting for services ==="
+            sleep 15
+            docker stack services "$REPO"
+
+            echo "=== Health check ==="
+            for i in 1 2 3 4 5; do
+              STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health 2>/dev/null || echo "000")
+              echo "Attempt $i: HTTP $STATUS"
+              [ "$STATUS" = "200" ] && echo "✅ Deploy OK" && exit 0
+              sleep 6
+            done
+
+            echo "⚠️  Health check failed — service logs:"
+            docker service logs "${REPO}_gateway" --tail 30 || true
+            exit 1
+          DEPLOY
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
 
       - name: Cleanup SSH key
         if: always()

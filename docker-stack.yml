@@ -31,7 +31,7 @@ services:
           - node.role == manager
 
   gateway:
-    image: ${DOCKER_REGISTRY:-localhost:5000}/api-gateway:${IMAGE_TAG:-latest}
+    image: ${IMAGE_NAME:-api-gateway}:${IMAGE_TAG:-latest}
     networks:
       - gateway-net
     ports:
