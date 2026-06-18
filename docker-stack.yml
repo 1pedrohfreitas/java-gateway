@@ -31,11 +31,9 @@ services:
           - node.role == manager
 
   gateway:
-    image: ${IMAGE_NAME:-api-gateway}:${IMAGE_TAG:-latest}
+    image: ${IMAGE_BACKEND:-api-gateway}:${IMAGE_TAG:-latest}
     networks:
       - gateway-net
-    ports:
-      - "8080:8080"
     environment:
       SPRING_PROFILES_ACTIVE: prod
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/apigateway
@@ -58,6 +56,28 @@ services:
         delay: 10s
         order: start-first
         failure_action: rollback
+
+  frontend:
+    image: ${IMAGE_FRONTEND:-api-gateway-frontend}:${IMAGE_TAG:-latest}
+    networks:
+      - gateway-net
+    ports:
+      - "80:80"
+    depends_on:
+      - gateway
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      update_config:
+        parallelism: 1
+        delay: 5s
+        order: start-first
 
 volumes:
   pgdata:
