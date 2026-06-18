@@ -27,13 +27,10 @@ env:
   JAVA_VERSION: '21'
   NODE_VERSION: '24'
 
-# ============================================================
-# Jobs
-# ============================================================
 jobs:
 
   # ==========================================================
-  # Detect changed paths (for push events)
+  # Detect changed paths
   # ==========================================================
   changes:
     name: Detect Changes
@@ -43,9 +40,7 @@ jobs:
       frontend: ${{ steps.filter.outputs.frontend }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check changed paths
-        id: filter
+      - id: filter
         uses: dorny/paths-filter@v3
         with:
           filters: |
@@ -74,18 +69,13 @@ jobs:
       !(github.event_name == 'workflow_dispatch' && inputs.skip_tests)
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: 'temurin'
           cache: 'maven'
-
-      - name: Run tests
-        run: ./mvnw test -B
-
-      - name: Publish test report
-        if: always()
+      - run: ./mvnw test -B
+      - if: always()
         uses: dorny/test-reporter@v1
         with:
           name: Backend Tests
@@ -93,7 +83,7 @@ jobs:
           reporter: java-junit
 
   # ==========================================================
-  # Backend Deploy → Server
+  # Backend Deploy → VPS
   # ==========================================================
   deploy-backend:
     name: Deploy Backend
@@ -108,7 +98,6 @@ jobs:
       name: production
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
@@ -118,60 +107,83 @@ jobs:
       - name: Build JAR
         run: ./mvnw clean package -DskipTests -B
 
-      # -------------------------------------------------------
-      # SSH steps — all guarded by secret presence
-      # -------------------------------------------------------
+      # ---- Verify secrets before attempting deploy ----
+      - name: Check deploy secrets
+        id: check-secrets
+        run: |
+          MISSING=""
+          if [ -z "$HOST" ]; then MISSING="$MISSING SSH_HOST"; fi
+          if [ -z "$USER" ]; then MISSING="$MISSING SSH_USER"; fi
+          if [ -z "$KEY" ]; then MISSING="$MISSING SSH_PRIVATE_KEY"; fi
+
+          if [ -n "$MISSING" ]; then
+            echo "=============================================="
+            echo " ❌ DEPLOY BLOCKED — MISSING SECRETS:"
+            echo "    $MISSING"
+            echo ""
+            echo " Configure them at:"
+            echo "    GitHub → Settings → Secrets and variables"
+            echo "    → Actions → Repository secrets"
+            echo ""
+            echo " Required secrets:"
+            echo "    SSH_HOST       = your VPS IP"
+            echo "    SSH_USER       = root"
+            echo "    SSH_PRIVATE_KEY = your SSH private key"
+            echo "=============================================="
+            echo "secrets_ok=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "✅ All deploy secrets present"
+          echo "secrets_ok=true" >> "$GITHUB_OUTPUT"
+          echo "host=${HOST:0:4}***" >> "$GITHUB_OUTPUT"
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ secrets.SSH_USER }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Setup SSH
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          if [ -z "$HOST" ] || [ -z "$KEY" ]; then
-            echo "⚠️  SSH_HOST or SSH_PRIVATE_KEY not set — skipping SSH setup"
-            exit 0
-          fi
           mkdir -p ~/.ssh
           echo "$KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts
+          echo "✅ SSH configured for ${USER}@${HOST}:${PORT:-22}"
         env:
           HOST: ${{ secrets.SSH_HOST }}
           PORT: ${{ secrets.SSH_PORT }}
+          USER: ${{ secrets.SSH_USER }}
           KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Prepare server
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
-            echo "⚠️  Skipping — no SSH config"
-            exit 0
-          fi
           ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
             "id -u api-gateway &>/dev/null || useradd -r -s /bin/false api-gateway; \
              mkdir -p /opt/api-gateway; chown -R api-gateway:api-gateway /opt/api-gateway"
+          echo "✅ Server ready"
         env:
           HOST: ${{ secrets.SSH_HOST }}
           PORT: ${{ secrets.SSH_PORT }}
           USER: ${{ secrets.SSH_USER }}
 
       - name: Deploy JAR
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
-            echo "⚠️  Skipping — no SSH config"
-            exit 0
-          fi
           JAR_FILE=$(ls target/api-gateway-*.jar | grep -v original | head -1)
           echo "Uploading: $JAR_FILE"
           rsync -avz -e "ssh -i ~/.ssh/deploy_key -p ${PORT:-22}" \
             "$JAR_FILE" "${USER}@${HOST}:/opt/api-gateway/api-gateway.jar"
+          echo "✅ JAR uploaded"
         env:
           HOST: ${{ secrets.SSH_HOST }}
           PORT: ${{ secrets.SSH_PORT }}
           USER: ${{ secrets.SSH_USER }}
 
-      - name: Update systemd & restart
+      - name: Restart service
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
-            echo "⚠️  Skipping — no SSH config"
-            exit 0
-          fi
           scp -i ~/.ssh/deploy_key -P "${PORT:-22}" \
             deploy/api-gateway.service \
             "${USER}@${HOST}:/etc/systemd/system/api-gateway.service"
@@ -179,17 +191,15 @@ jobs:
             "chown api-gateway:api-gateway /opt/api-gateway/api-gateway.jar && \
              systemctl daemon-reload && systemctl enable api-gateway && \
              (systemctl is-active --quiet api-gateway && systemctl restart api-gateway || systemctl start api-gateway)"
+          echo "✅ Service restarted"
         env:
           HOST: ${{ secrets.SSH_HOST }}
           PORT: ${{ secrets.SSH_PORT }}
           USER: ${{ secrets.SSH_USER }}
 
       - name: Health check
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
-            echo "⚠️  Skipping health check — no SSH config"
-            exit 0
-          fi
           sleep 10
           for i in 1 2 3 4 5; do
             set +e
@@ -197,21 +207,23 @@ jobs:
               "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health" 2>/dev/null) || STATUS="000"
             set -e
             echo "Attempt $i: HTTP $STATUS"
-            [ "$STATUS" = "200" ] && echo "✅ Backend healthy" && exit 0
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Backend healthy — deploy successful!"
+              exit 0
+            fi
             sleep 4
           done
-          echo "⚠️  Health check failed"
+          echo "⚠️  Health check failed — check logs on server"
         env:
           HOST: ${{ secrets.SSH_HOST }}
           PORT: ${{ secrets.SSH_PORT }}
           USER: ${{ secrets.SSH_USER }}
 
-      - name: Cleanup SSH key
-        if: always()
+      - if: always()
         run: rm -f ~/.ssh/deploy_key
 
   # ==========================================================
-  # Frontend Deploy → Server
+  # Frontend Deploy → VPS
   # ==========================================================
   deploy-frontend:
     name: Deploy Frontend
@@ -229,7 +241,6 @@ jobs:
       name: production
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -243,54 +254,67 @@ jobs:
         env:
           VITE_API_URL: ${{ secrets.VITE_API_URL || '/api/gateway' }}
 
-      - name: Setup SSH
+      # ---- Verify secrets ----
+      - name: Check deploy secrets
+        id: check-secrets
         run: |
-          if [ -z "$HOST" ] || [ -z "$KEY" ]; then
-            echo "⚠️  SSH_HOST or SSH_PRIVATE_KEY not set — skipping SSH setup"
-            exit 0
+          MISSING=""
+          if [ -z "$HOST" ]; then MISSING="$MISSING SSH_HOST"; fi
+          if [ -z "$USER" ]; then MISSING="$MISSING SSH_USER"; fi
+          if [ -z "$KEY" ]; then MISSING="$MISSING SSH_PRIVATE_KEY"; fi
+
+          if [ -n "$MISSING" ]; then
+            echo "=============================================="
+            echo " ❌ DEPLOY BLOCKED — MISSING SECRETS:"
+            echo "    $MISSING"
+            echo ""
+            echo " Configure at:"
+            echo "    GitHub → Settings → Secrets and variables"
+            echo "    → Actions → Repository secrets"
+            echo "=============================================="
+            echo "secrets_ok=false" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
+
+          echo "✅ All deploy secrets present"
+          echo "secrets_ok=true" >> "$GITHUB_OUTPUT"
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ secrets.SSH_USER }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Setup SSH
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
+        run: |
           mkdir -p ~/.ssh
           echo "$KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts
-        env:
-          HOST: ${{ secrets.SSH_HOST }}
-          PORT: ${{ secrets.SSH_PORT }}
-          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-
-      - name: Prepare server
-        run: |
-          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
-            echo "⚠️  Skipping — no SSH config"
-            exit 0
-          fi
-          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
-            "mkdir -p /var/www/api-gateway-admin"
+          echo "✅ SSH configured for ${USER}@${HOST}:${PORT:-22}"
         env:
           HOST: ${{ secrets.SSH_HOST }}
           PORT: ${{ secrets.SSH_PORT }}
           USER: ${{ secrets.SSH_USER }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Deploy files
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
-            echo "⚠️  Skipping — no SSH config"
-            exit 0
-          fi
+          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
+            "mkdir -p /var/www/api-gateway-admin"
+
           rsync -avz --delete \
             -e "ssh -i ~/.ssh/deploy_key -p ${PORT:-22}" \
             dist/ "${USER}@${HOST}:/var/www/api-gateway-admin/"
+          echo "✅ Files uploaded"
         env:
           HOST: ${{ secrets.SSH_HOST }}
           PORT: ${{ secrets.SSH_PORT }}
           USER: ${{ secrets.SSH_USER }}
 
       - name: Configure nginx
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
-            echo "⚠️  Skipping — no SSH config"
-            exit 0
-          fi
           scp -i ~/.ssh/deploy_key -P "${PORT:-22}" \
             ../deploy/nginx-gateway-admin.conf \
             "${USER}@${HOST}:/etc/nginx/sites-available/api-gateway-admin"
@@ -298,27 +322,24 @@ jobs:
             "command -v nginx || (apt-get update -qq && apt-get install -y -qq nginx); \
              ln -sf /etc/nginx/sites-available/api-gateway-admin /etc/nginx/sites-enabled/; \
              nginx -t && systemctl reload nginx"
+          echo "✅ Nginx configured"
         env:
           HOST: ${{ secrets.SSH_HOST }}
           PORT: ${{ secrets.SSH_PORT }}
           USER: ${{ secrets.SSH_USER }}
 
       - name: Verify
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          if [ -z "$HOST" ] || [ ! -f ~/.ssh/deploy_key ]; then
-            echo "⚠️  Skipping verify — no SSH config"
-            exit 0
-          fi
           set +e
           STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://${HOST}/" 2>/dev/null) || STATUS="000"
           set -e
           echo "HTTP status: $STATUS"
-          [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ] || [ "$STATUS" = "302" ] && echo "✅ Frontend OK" || echo "⚠️  Status: $STATUS"
+          [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ] || [ "$STATUS" = "302" ] && echo "✅ Frontend deploy OK" || echo "⚠️  Status: $STATUS"
         env:
           HOST: ${{ secrets.SSH_HOST }}
 
-      - name: Cleanup SSH key
-        if: always()
+      - if: always()
         run: rm -f ~/.ssh/deploy_key
 
   # ==========================================================
@@ -336,24 +357,19 @@ jobs:
       image_tag: ${{ steps.meta.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: docker/setup-buildx-action@v3
-
-      - name: Docker metadata
-        id: meta
+      - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}/api-gateway
           tags: |
             type=ref,event=tag
             type=sha,prefix=swarm-
-
       - uses: docker/login-action@v3
         with:
           registry: ${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
-
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -379,35 +395,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy stack
+      - name: Check secrets
+        id: check
         run: |
-          if [ -z "$HOST" ] || [ -z "$KEY" ]; then
-            echo "⚠️  SWARM_PROD_HOST or SWARM_PROD_SSH_KEY not set — skipping"
-            exit 0
+          MISSING=""
+          [ -z "$HOST" ] && MISSING="$MISSING SWARM_PROD_HOST"
+          [ -z "$USER" ] && MISSING="$MISSING SWARM_PROD_USER"
+          [ -z "$KEY" ]  && MISSING="$MISSING SWARM_PROD_SSH_KEY"
+          if [ -n "$MISSING" ]; then
+            echo "❌ MISSING:$MISSING"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        env:
+          HOST: ${{ secrets.SWARM_PROD_HOST }}
+          USER: ${{ secrets.SWARM_PROD_USER }}
+          KEY: ${{ secrets.SWARM_PROD_SSH_KEY }}
+
+      - name: Deploy
+        if: steps.check.outputs.ok == 'true'
+        run: |
           mkdir -p ~/.ssh
           echo "$KEY" > ~/.ssh/swarm_key
           chmod 600 ~/.ssh/swarm_key
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts || true
-
-          export IMAGE_TAG="${{ needs.swarm-build.outputs.image_tag }}"
-          export REGISTRY="${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}"
-
-          scp -i ~/.ssh/swarm_key docker-stack.yml \
-            "${SSH_USER}@${HOST}:/tmp/docker-stack.yml"
-
-          ssh -i ~/.ssh/swarm_key "${SSH_USER}@${HOST}" \
-            "DOCKER_REGISTRY=${REGISTRY} IMAGE_TAG=${IMAGE_TAG} \
+          TAG="${{ needs.swarm-build.outputs.image_tag }}"
+          REG="${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}"
+          scp -i ~/.ssh/swarm_key docker-stack.yml "${USER}@${HOST}:/tmp/docker-stack.yml"
+          ssh -i ~/.ssh/swarm_key "${USER}@${HOST}" \
+            "DOCKER_REGISTRY=${REG} IMAGE_TAG=${TAG} \
              docker stack deploy -c /tmp/docker-stack.yml api-gateway --prune --resolve-image always"
-
           rm -f ~/.ssh/swarm_key
+          echo "✅ Swarm deploy OK"
         env:
           HOST: ${{ secrets.SWARM_PROD_HOST }}
+          USER: ${{ secrets.SWARM_PROD_USER }}
           KEY: ${{ secrets.SWARM_PROD_SSH_KEY }}
-          SSH_USER: ${{ secrets.SWARM_PROD_USER }}
 
   # ==========================================================
-  # Security Scan (on tags only)
+  # Security Scan
   # ==========================================================
   scan:
     name: Security Scan
