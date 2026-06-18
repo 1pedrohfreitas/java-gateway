@@ -14,10 +14,6 @@ on:
         description: 'Deploy Frontend Admin'
         type: boolean
         default: true
-      swarm_deploy:
-        description: 'Docker Swarm deploy'
-        type: boolean
-        default: false
       skip_tests:
         description: 'Skip tests'
         type: boolean
@@ -94,6 +90,8 @@ jobs:
       (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
       (needs.changes.outputs.backend == 'true' || github.event_name == 'workflow_dispatch') &&
       (github.event_name != 'workflow_dispatch' || inputs.deploy_backend)
+    env:
+      SSH_FLAGS: -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -105,137 +103,49 @@ jobs:
       - name: Build JAR
         run: ./mvnw clean package -DskipTests -B
 
-      # ---- Verify secrets before attempting deploy ----
-      - name: Check deploy secrets
-        id: check-secrets
-        run: |
-          MISSING=""
-          if [ -z "$HOST" ]; then MISSING="$MISSING SSH_HOST"; fi
-          if [ -z "$USER" ]; then MISSING="$MISSING SSH_USER"; fi
-          if [ -z "$KEY" ]; then MISSING="$MISSING SSH_PRIVATE_KEY"; fi
-
-          if [ -n "$MISSING" ]; then
-            echo "=============================================="
-            echo " ❌ DEPLOY BLOCKED — MISSING SECRETS:"
-            echo "    $MISSING"
-            echo ""
-            echo " Configure them at:"
-            echo "    GitHub → Settings → Secrets and variables"
-            echo "    → Actions → Repository secrets"
-            echo ""
-            echo " Required secrets:"
-            echo "    SSH_HOST       = your VPS IP"
-            echo "    SSH_USER       = root"
-            echo "    SSH_PRIVATE_KEY = your SSH private key"
-            echo "=============================================="
-            echo "secrets_ok=false" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-
-          echo "✅ All deploy secrets present"
-          echo "secrets_ok=true" >> "$GITHUB_OUTPUT"
-          echo "host=${HOST:0:4}***" >> "$GITHUB_OUTPUT"
-        env:
-          HOST: ${{ secrets.SSH_HOST }}
-          USER: ${{ secrets.SSH_USER }}
-          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-
       - name: Setup SSH
-        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          mkdir -p ~/.ssh
-
-          # Validate key format
-          if ! echo "$KEY" | grep -q "PRIVATE KEY-----"; then
-            echo "❌ SSH key is invalid — missing BEGIN/END markers"
-            echo "   Ensure you copied the ENTIRE key including:"
-            echo "   -----BEGIN ... PRIVATE KEY-----"
-            echo "   ..."
-            echo "   -----END ... PRIVATE KEY-----"
+          if [ -z "$HOST" ] || [ -z "$KEY" ]; then
+            echo "❌ Missing SSH_HOST or SSH_PRIVATE_KEY secret"
             exit 1
           fi
-
-          # Write key preserving format (printf handles newlines correctly)
+          mkdir -p ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-
-          # Verify key is readable by ssh
-          if ! ssh-keygen -l -f ~/.ssh/deploy_key >/dev/null 2>&1; then
-            echo "❌ SSH key is malformed or encrypted with passphrase"
-            echo "   Use an unencrypted key or generate a new one:"
-            echo "   ssh-keygen -t ed25519 -f deploy_key -N ''"
-            exit 1
-          fi
-
+          ssh-keygen -l -f ~/.ssh/deploy_key >/dev/null 2>&1 || { echo "❌ Invalid SSH key"; exit 1; }
           ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
-          echo "✅ SSH configured for ${USER}@${HOST}:${PORT:-22}"
         env:
           HOST: ${{ secrets.SSH_HOST }}
           PORT: ${{ secrets.SSH_PORT }}
-          USER: ${{ secrets.SSH_USER }}
           KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Prepare server
-        if: steps.check-secrets.outputs.secrets_ok == 'true'
+      - name: Deploy
         run: |
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
+          ssh ${SSH_FLAGS} "${USER}@${HOST}" \
             "id -u api-gateway &>/dev/null || useradd -r -s /bin/false api-gateway; \
              mkdir -p /opt/api-gateway; chown -R api-gateway:api-gateway /opt/api-gateway"
-          echo "✅ Server ready"
-        env:
-          HOST: ${{ secrets.SSH_HOST }}
-          PORT: ${{ secrets.SSH_PORT }}
-          USER: ${{ secrets.SSH_USER }}
 
-      - name: Deploy JAR
-        if: steps.check-secrets.outputs.secrets_ok == 'true'
-        run: |
-          JAR_FILE=$(ls target/api-gateway-*.jar | grep -v original | head -1)
-          echo "Uploading: $JAR_FILE"
-          rsync -avz -e "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p ${PORT:-22}" \
-            "$JAR_FILE" "${USER}@${HOST}:/opt/api-gateway/api-gateway.jar"
-          echo "✅ JAR uploaded"
-        env:
-          HOST: ${{ secrets.SSH_HOST }}
-          PORT: ${{ secrets.SSH_PORT }}
-          USER: ${{ secrets.SSH_USER }}
+          JAR=$(ls target/api-gateway-*.jar | grep -v original | head -1)
+          rsync -avz -e "ssh ${SSH_FLAGS}" "$JAR" "${USER}@${HOST}:/opt/api-gateway/api-gateway.jar"
 
-      - name: Restart service
-        if: steps.check-secrets.outputs.secrets_ok == 'true'
-        run: |
-          scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -P "${PORT:-22}" \
-            deploy/api-gateway.service \
-            "${USER}@${HOST}:/etc/systemd/system/api-gateway.service"
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
+          scp ${SSH_FLAGS} deploy/api-gateway.service "${USER}@${HOST}:/etc/systemd/system/api-gateway.service"
+          ssh ${SSH_FLAGS} "${USER}@${HOST}" \
             "chown api-gateway:api-gateway /opt/api-gateway/api-gateway.jar && \
              systemctl daemon-reload && systemctl enable api-gateway && \
              (systemctl is-active --quiet api-gateway && systemctl restart api-gateway || systemctl start api-gateway)"
-          echo "✅ Service restarted"
-        env:
-          HOST: ${{ secrets.SSH_HOST }}
-          PORT: ${{ secrets.SSH_PORT }}
-          USER: ${{ secrets.SSH_USER }}
 
-      - name: Health check
-        if: steps.check-secrets.outputs.secrets_ok == 'true'
-        run: |
-          sleep 10
+          sleep 8
           for i in 1 2 3 4 5; do
             set +e
-            STATUS=$(ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
+            STATUS=$(ssh ${SSH_FLAGS} "${USER}@${HOST}" \
               "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health" 2>/dev/null) || STATUS="000"
             set -e
-            echo "Attempt $i: HTTP $STATUS"
-            if [ "$STATUS" = "200" ]; then
-              echo "✅ Backend healthy — deploy successful!"
-              exit 0
-            fi
+            [ "$STATUS" = "200" ] && echo "✅ Deploy OK" && exit 0
             sleep 4
           done
-          echo "⚠️  Health check failed — check logs on server"
+          echo "⚠️  Health check failed"
         env:
           HOST: ${{ secrets.SSH_HOST }}
-          PORT: ${{ secrets.SSH_PORT }}
           USER: ${{ secrets.SSH_USER }}
 
       - if: always()
@@ -256,6 +166,8 @@ jobs:
     defaults:
       run:
         working-directory: frontend
+    env:
+      SSH_FLAGS: -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -264,115 +176,53 @@ jobs:
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install & Build
+      - name: Build
         run: |
           npm ci
           npm run build
         env:
           VITE_API_URL: ${{ secrets.VITE_API_URL || '/api/gateway' }}
 
-      # ---- Verify secrets ----
-      - name: Check deploy secrets
-        id: check-secrets
-        run: |
-          MISSING=""
-          if [ -z "$HOST" ]; then MISSING="$MISSING SSH_HOST"; fi
-          if [ -z "$USER" ]; then MISSING="$MISSING SSH_USER"; fi
-          if [ -z "$KEY" ]; then MISSING="$MISSING SSH_PRIVATE_KEY"; fi
-
-          if [ -n "$MISSING" ]; then
-            echo "=============================================="
-            echo " ❌ DEPLOY BLOCKED — MISSING SECRETS:"
-            echo "    $MISSING"
-            echo ""
-            echo " Configure at:"
-            echo "    GitHub → Settings → Secrets and variables"
-            echo "    → Actions → Repository secrets"
-            echo "=============================================="
-            echo "secrets_ok=false" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-
-          echo "✅ All deploy secrets present"
-          echo "secrets_ok=true" >> "$GITHUB_OUTPUT"
-        env:
-          HOST: ${{ secrets.SSH_HOST }}
-          USER: ${{ secrets.SSH_USER }}
-          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-
       - name: Setup SSH
-        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          mkdir -p ~/.ssh
-
-          if ! echo "$KEY" | grep -q "PRIVATE KEY-----"; then
-            echo "❌ SSH key is invalid — missing BEGIN/END markers"
+          if [ -z "$HOST" ] || [ -z "$KEY" ]; then
+            echo "❌ Missing SSH_HOST or SSH_PRIVATE_KEY secret"
             exit 1
           fi
-
+          mkdir -p ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-
-          if ! ssh-keygen -l -f ~/.ssh/deploy_key >/dev/null 2>&1; then
-            echo "❌ SSH key is malformed or encrypted with passphrase"
-            exit 1
-          fi
-
+          ssh-keygen -l -f ~/.ssh/deploy_key >/dev/null 2>&1 || { echo "❌ Invalid SSH key"; exit 1; }
           ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
-          echo "✅ SSH configured for ${USER}@${HOST}:${PORT:-22}"
         env:
           HOST: ${{ secrets.SSH_HOST }}
           PORT: ${{ secrets.SSH_PORT }}
-          USER: ${{ secrets.SSH_USER }}
           KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Deploy files
-        if: steps.check-secrets.outputs.secrets_ok == 'true'
+      - name: Deploy
         run: |
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
-            "mkdir -p /var/www/api-gateway-admin"
+          ssh ${SSH_FLAGS} "${USER}@${HOST}" "mkdir -p /var/www/api-gateway-admin"
+          rsync -avz --delete -e "ssh ${SSH_FLAGS}" dist/ "${USER}@${HOST}:/var/www/api-gateway-admin/"
 
-          rsync -avz --delete \
-            -e "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p ${PORT:-22}" \
-            dist/ "${USER}@${HOST}:/var/www/api-gateway-admin/"
-          echo "✅ Files uploaded"
-        env:
-          HOST: ${{ secrets.SSH_HOST }}
-          PORT: ${{ secrets.SSH_PORT }}
-          USER: ${{ secrets.SSH_USER }}
-
-      - name: Configure nginx
-        if: steps.check-secrets.outputs.secrets_ok == 'true'
-        run: |
-          scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -P "${PORT:-22}" \
-            ../deploy/nginx-gateway-admin.conf \
-            "${USER}@${HOST}:/etc/nginx/sites-available/api-gateway-admin"
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
+          scp ${SSH_FLAGS} ../deploy/nginx-gateway-admin.conf "${USER}@${HOST}:/etc/nginx/sites-available/api-gateway-admin"
+          ssh ${SSH_FLAGS} "${USER}@${HOST}" \
             "command -v nginx || (apt-get update -qq && apt-get install -y -qq nginx); \
              ln -sf /etc/nginx/sites-available/api-gateway-admin /etc/nginx/sites-enabled/; \
              nginx -t && systemctl reload nginx"
-          echo "✅ Nginx configured"
-        env:
-          HOST: ${{ secrets.SSH_HOST }}
-          PORT: ${{ secrets.SSH_PORT }}
-          USER: ${{ secrets.SSH_USER }}
 
-      - name: Verify
-        if: steps.check-secrets.outputs.secrets_ok == 'true'
-        run: |
           set +e
           STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://${HOST}/" 2>/dev/null) || STATUS="000"
           set -e
-          echo "HTTP status: $STATUS"
-          [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ] || [ "$STATUS" = "302" ] && echo "✅ Frontend deploy OK" || echo "⚠️  Status: $STATUS"
+          [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ] || [ "$STATUS" = "302" ] && echo "✅ Deploy OK" || echo "⚠️  Status: $STATUS"
         env:
           HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ secrets.SSH_USER }}
 
       - if: always()
         run: rm -f ~/.ssh/deploy_key
 
   # ==========================================================
-  # Docker Swarm Build & Push
+  # Docker Swarm (só em tags v*)
   # ==========================================================
   swarm-build:
     name: Swarm Build
@@ -381,7 +231,7 @@ jobs:
     if: |
       !cancelled() &&
       (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
-      (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.swarm_deploy))
+      startsWith(github.ref, 'refs/tags/v')
     outputs:
       image_tag: ${{ steps.meta.outputs.version }}
     steps:
@@ -391,9 +241,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}/api-gateway
-          tags: |
-            type=ref,event=tag
-            type=sha,prefix=swarm-
+          tags: type=ref,event=tag
       - uses: docker/login-action@v3
         with:
           registry: ${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}
@@ -405,14 +253,10 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
 
-  # ==========================================================
-  # Docker Swarm Deploy
-  # ==========================================================
   swarm-deploy:
     name: Swarm Deploy
     runs-on: ubuntu-latest
@@ -421,32 +265,12 @@ jobs:
       !cancelled() && needs.swarm-build.result == 'success'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check secrets
-        id: check
-        run: |
-          MISSING=""
-          [ -z "$HOST" ] && MISSING="$MISSING SWARM_PROD_HOST"
-          [ -z "$USER" ] && MISSING="$MISSING SWARM_PROD_USER"
-          [ -z "$KEY" ]  && MISSING="$MISSING SWARM_PROD_SSH_KEY"
-          if [ -n "$MISSING" ]; then
-            echo "❌ MISSING:$MISSING"
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          echo "ok=true" >> "$GITHUB_OUTPUT"
-        env:
-          HOST: ${{ secrets.SWARM_PROD_HOST }}
-          USER: ${{ secrets.SWARM_PROD_USER }}
-          KEY: ${{ secrets.SWARM_PROD_SSH_KEY }}
-
       - name: Deploy
-        if: steps.check.outputs.ok == 'true'
         run: |
           mkdir -p ~/.ssh
-          echo "$KEY" > ~/.ssh/swarm_key
+          printf '%s\n' "$KEY" > ~/.ssh/swarm_key
           chmod 600 ~/.ssh/swarm_key
-          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts || true
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
           TAG="${{ needs.swarm-build.outputs.image_tag }}"
           REG="${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}"
           scp -i ~/.ssh/swarm_key docker-stack.yml "${USER}@${HOST}:/tmp/docker-stack.yml"
@@ -454,25 +278,7 @@ jobs:
             "DOCKER_REGISTRY=${REG} IMAGE_TAG=${TAG} \
              docker stack deploy -c /tmp/docker-stack.yml api-gateway --prune --resolve-image always"
           rm -f ~/.ssh/swarm_key
-          echo "✅ Swarm deploy OK"
         env:
           HOST: ${{ secrets.SWARM_PROD_HOST }}
           USER: ${{ secrets.SWARM_PROD_USER }}
           KEY: ${{ secrets.SWARM_PROD_SSH_KEY }}
-
-  # ==========================================================
-  # Security Scan
-  # ==========================================================
-  scan:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    needs: swarm-build
-    if: |
-      !cancelled() && needs.swarm-build.result == 'success'
-    steps:
-      - uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}/api-gateway:${{ needs.swarm-build.outputs.image_tag }}
-          format: 'table'
-          exit-code: 0
-          severity: 'CRITICAL,HIGH'
