@@ -9,9 +9,9 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      HOST: ${{ secrets.SSH_HOST }}
-      USER: ${{ secrets.SSH_USER }}
-      PORT: ${{ secrets.SSH_PORT }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
 
     steps:
       - uses: actions/checkout@v4
@@ -21,25 +21,28 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p "$PORT" -H "$HOST" >> ~/.ssh/known_hosts
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts
 
       - name: Deploy Swarm
         run: |
           REPO_NAME=$(echo "${GITHUB_REPOSITORY}" | cut -d'/' -f2)
+          BRANCH="${GITHUB_REF#refs/heads/}"
 
-          ssh -i ~/.ssh/deploy_key -p "$PORT" "$USER@$HOST" "
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
             set -e
 
-            APP_DIR=/root/deploy/$REPO_NAME
+            APP_DIR=\$HOME/deploy/$REPO_NAME
 
             if [ ! -d \$APP_DIR ]; then
               git clone https://github.com/${GITHUB_REPOSITORY}.git \$APP_DIR
             fi
 
             cd \$APP_DIR
-            git pull origin main
+            git pull origin $BRANCH
 
             docker stack deploy -c docker-stack.yml $REPO_NAME --prune --resolve-image always
           "
 
-      - run: rm -f ~/.ssh/deploy_key
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
