@@ -1,55 +1,20 @@
-# Docker Swarm Stack — api-gateway
-#
-# Deploy:
-#   docker swarm init          (if not already initialized)
-#   docker stack deploy -c docker-stack.yml api-gateway
-#
-# Manage:
-#   docker stack ls
-#   docker stack services api-gateway
-#   docker service logs api-gateway_gateway
-#   docker stack rm api-gateway
-
 version: "3.9"
 
-# ---- Secrets (managed externally via `docker secret create`) ----
-secrets:
-  db_password:
-    external: true
-    name: api_gateway_db_password
-  db_username:
-    external: true
-    name: api_gateway_db_username
-  jwt_secret:
-    external: true
-    name: api_gateway_jwt_secret
-
-# ---- Configs (optional application.properties overrides) ----
-configs:
-  gateway_config:
-    file: ./application-prod.properties
-
-# ---- Networks ----
 networks:
   gateway-net:
     driver: overlay
     attachable: true
 
-# ---- Services ----
 services:
 
-  # ==================== PostgreSQL ====================
   postgres:
     image: postgres:16-alpine
     networks:
       - gateway-net
     environment:
       POSTGRES_DB: apigateway
-      POSTGRES_USER_FILE: /run/secrets/db_username
-      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
-    secrets:
-      - db_username
-      - db_password
+      POSTGRES_USER: apigateway
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-apigateway}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -57,25 +22,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 30s
     deploy:
       replicas: 1
       restart_policy:
         condition: on-failure
-        delay: 5s
-        max_attempts: 3
-      resources:
-        limits:
-          cpus: "1"
-          memory: 512M
-        reservations:
-          cpus: "0.5"
-          memory: 256M
       placement:
         constraints:
           - node.role == manager
 
-  # ==================== API Gateway ====================
   gateway:
     image: ${DOCKER_REGISTRY:-localhost:5000}/api-gateway:${IMAGE_TAG:-latest}
     networks:
@@ -83,16 +37,11 @@ services:
     ports:
       - "8080:8080"
     environment:
-      DATABASE_URL: jdbc:postgresql://postgres:5432/apigateway
       SPRING_PROFILES_ACTIVE: prod
-    secrets:
-      - db_username
-      - db_password
-      - jwt_secret
-    configs:
-      - source: gateway_config
-        target: /app/application-prod.properties
-        mode: 0440
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/apigateway
+      SPRING_DATASOURCE_USERNAME: apigateway
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:-apigateway}
+      GATEWAY_JWT_SECRET: ${JWT_SECRET:-change-me-in-production-use-at-least-256-bits-key}
     depends_on:
       - postgres
     healthcheck:
@@ -100,32 +49,15 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
-      start_period: 40s
     deploy:
       replicas: 2
       restart_policy:
         condition: on-failure
-        delay: 10s
-        max_attempts: 3
-        window: 120s
       update_config:
         parallelism: 1
         delay: 10s
         order: start-first
         failure_action: rollback
-      rollback_config:
-        parallelism: 1
-        delay: 5s
-        order: stop-first
-      resources:
-        limits:
-          cpus: "1"
-          memory: 512M
-        reservations:
-          cpus: "0.5"
-          memory: 256M
 
-# ---- Volumes ----
 volumes:
   pgdata:
-    driver: local
