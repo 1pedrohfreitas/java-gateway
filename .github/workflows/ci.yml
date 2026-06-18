@@ -1,0 +1,335 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      deploy_backend:
+        description: 'Deploy Backend JAR'
+        type: boolean
+        default: true
+      deploy_frontend:
+        description: 'Deploy Frontend Admin'
+        type: boolean
+        default: true
+      swarm_deploy:
+        description: 'Docker Swarm deploy'
+        type: boolean
+        default: false
+      skip_tests:
+        description: 'Skip tests'
+        type: boolean
+        default: false
+
+env:
+  JAVA_VERSION: '21'
+  NODE_VERSION: '24'
+
+# ============================================================
+# Jobs
+# ============================================================
+jobs:
+
+  # ==========================================================
+  # Detect changed paths (for push events)
+  # ==========================================================
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            backend:
+              - 'src/**'
+              - 'pom.xml'
+              - '.github/workflows/ci.yml'
+              - 'deploy/api-gateway.service'
+              - 'Dockerfile'
+              - 'entrypoint.sh'
+            frontend:
+              - 'frontend/**'
+              - '.github/workflows/ci.yml'
+              - 'deploy/nginx-gateway-admin.conf'
+
+  # ==========================================================
+  # Backend Test
+  # ==========================================================
+  test-backend:
+    name: Test Backend
+    runs-on: ubuntu-latest
+    needs: changes
+    if: |
+      !cancelled() &&
+      (needs.changes.outputs.backend == 'true' || github.event_name == 'workflow_dispatch') &&
+      !(github.event_name == 'workflow_dispatch' && inputs.skip_tests)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run tests
+        run: ./mvnw test -B
+
+      - name: Publish test report
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Backend Tests
+          path: target/surefire-reports/TEST-*.xml
+          reporter: java-junit
+
+  # ==========================================================
+  # Backend Deploy → Server
+  # ==========================================================
+  deploy-backend:
+    name: Deploy Backend
+    runs-on: ubuntu-latest
+    needs: [changes, test-backend]
+    if: |
+      !cancelled() &&
+      (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
+      (needs.changes.outputs.backend == 'true' || github.event_name == 'workflow_dispatch') &&
+      (github.event_name != 'workflow_dispatch' || inputs.deploy_backend)
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build JAR
+        run: ./mvnw clean package -DskipTests -B
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p ${{ secrets.SSH_PORT || '22' }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Prepare server
+        run: |
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "id -u api-gateway &>/dev/null || useradd -r -s /bin/false api-gateway; \
+             mkdir -p /opt/api-gateway; chown -R api-gateway:api-gateway /opt/api-gateway"
+
+      - name: Deploy JAR
+        run: |
+          JAR_FILE=$(ls target/api-gateway-*.jar | grep -v original | head -1)
+          echo "Uploading: $JAR_FILE"
+          rsync -avz -e "ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }}" \
+            "$JAR_FILE" ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/api-gateway/api-gateway.jar
+
+      - name: Update systemd & restart
+        run: |
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT || '22' }} \
+            deploy/api-gateway.service \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/etc/systemd/system/api-gateway.service
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "chown api-gateway:api-gateway /opt/api-gateway/api-gateway.jar && \
+             systemctl daemon-reload && systemctl enable api-gateway && \
+             (systemctl is-active --quiet api-gateway && systemctl restart api-gateway || systemctl start api-gateway)"
+
+      - name: Health check
+        run: |
+          sleep 10
+          for i in 1 2 3 4 5; do
+            set +e
+            STATUS=$(ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+              "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health" 2>/dev/null) || STATUS="000"
+            set -e
+            echo "Attempt $i: HTTP $STATUS"
+            [ "$STATUS" = "200" ] && echo "✅ Backend healthy" && exit 0
+            sleep 4
+          done
+          echo "⚠️  Health check failed"
+
+      - if: always()
+        run: rm -f ~/.ssh/deploy_key
+
+  # ==========================================================
+  # Frontend Deploy → Server
+  # ==========================================================
+  deploy-frontend:
+    name: Deploy Frontend
+    runs-on: ubuntu-latest
+    needs: changes
+    if: |
+      !cancelled() &&
+      needs.changes.result == 'success' &&
+      (needs.changes.outputs.frontend == 'true' || github.event_name == 'workflow_dispatch') &&
+      (github.event_name != 'workflow_dispatch' || inputs.deploy_frontend)
+    defaults:
+      run:
+        working-directory: frontend
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install & Build
+        run: |
+          npm ci
+          npm run build
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL || '/api/gateway' }}
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p ${{ secrets.SSH_PORT || '22' }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Prepare server
+        run: |
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "mkdir -p /var/www/api-gateway-admin"
+
+      - name: Deploy files
+        run: |
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }}" \
+            dist/ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/var/www/api-gateway-admin/
+
+      - name: Configure nginx
+        run: |
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT || '22' }} \
+            ../deploy/nginx-gateway-admin.conf \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/etc/nginx/sites-available/api-gateway-admin
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "command -v nginx || (apt-get update -qq && apt-get install -y -qq nginx); \
+             ln -sf /etc/nginx/sites-available/api-gateway-admin /etc/nginx/sites-enabled/; \
+             nginx -t && systemctl reload nginx"
+
+      - name: Verify
+        run: |
+          set +e
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://${{ secrets.SSH_HOST }}/ 2>/dev/null) || STATUS="000"
+          set -e
+          echo "HTTP status: $STATUS"
+          [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ] || [ "$STATUS" = "302" ] && echo "✅ Frontend OK" || echo "⚠️  Status: $STATUS"
+
+      - if: always()
+        run: rm -f ~/.ssh/deploy_key
+
+  # ==========================================================
+  # Docker Swarm Build & Push
+  # ==========================================================
+  swarm-build:
+    name: Swarm Build
+    runs-on: ubuntu-latest
+    needs: test-backend
+    if: |
+      !cancelled() &&
+      (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
+      (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.swarm_deploy))
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}/api-gateway
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=swarm-
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+  # ==========================================================
+  # Docker Swarm Deploy
+  # ==========================================================
+  swarm-deploy:
+    name: Swarm Deploy
+    runs-on: ubuntu-latest
+    needs: swarm-build
+    if: |
+      !cancelled() && needs.swarm-build.result == 'success'
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy stack
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SWARM_PROD_SSH_KEY }}" > ~/.ssh/swarm_key
+          chmod 600 ~/.ssh/swarm_key
+          ssh-keyscan -H ${{ secrets.SWARM_PROD_HOST }} >> ~/.ssh/known_hosts || true
+
+          export IMAGE_TAG="${{ needs.swarm-build.outputs.image_tag }}"
+          export REGISTRY="${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}"
+
+          scp -i ~/.ssh/swarm_key docker-stack.yml \
+            ${{ secrets.SWARM_PROD_USER }}@${{ secrets.SWARM_PROD_HOST }}:/tmp/docker-stack.yml
+
+          ssh -i ~/.ssh/swarm_key \
+            ${{ secrets.SWARM_PROD_USER }}@${{ secrets.SWARM_PROD_HOST }} \
+            "DOCKER_REGISTRY=${REGISTRY} IMAGE_TAG=${IMAGE_TAG} \
+             docker stack deploy -c /tmp/docker-stack.yml api-gateway --prune --resolve-image always"
+
+          rm -f ~/.ssh/swarm_key
+        env:
+          IMAGE_TAG: ${{ needs.swarm-build.outputs.image_tag }}
+
+  # ==========================================================
+  # Security Scan (on tags only)
+  # ==========================================================
+  scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: swarm-build
+    if: |
+      !cancelled() && needs.swarm-build.result == 'success'
+    steps:
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}/api-gateway:${{ needs.swarm-build.outputs.image_tag }}
+          format: 'table'
+          exit-code: 0
+          severity: 'CRITICAL,HIGH'

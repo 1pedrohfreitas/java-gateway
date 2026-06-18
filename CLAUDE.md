@@ -181,35 +181,42 @@ ssh root@212.85.17.130 systemctl restart api-gateway
 
 O serviço roda como usuário `api-gateway` em `/opt/api-gateway/api-gateway.jar`.
 
-### CI/CD (GitHub Actions)
+### CI/CD — Workflow Unificado
 
-| Workflow | Gatilho | Ações |
-|----------|---------|-------|
-| `Deploy.yml` | Push `main` / Manual | **Full stack**: test backend → build JAR → deploy JAR + systemd restart → build frontend → deploy static + nginx reload |
-| `DeployBackend.yml` | Push `src/**` / Manual | Só backend: test → build → deploy JAR → restart systemd |
-| `DeployFrontend.yml` | Push `frontend/**` / Manual | Só frontend: build → rsync → nginx reload |
-| `Build.yml` | Push `main`/`develop`/tags | Docker Swarm: test → build image → push registry → deploy stack |
+Arquivo único: `.github/workflows/ci.yml` (Node 24, Java 21)
 
-**Correções aplicadas (vs versão anterior):**
-- `inputs` só existe em `workflow_dispatch`; todas as condições `if` agora verificam `github.event_name == 'push' ||` antes de acessar `inputs`
-- `environment.url` removido (não aceita `${{ env }}`)
-- `needs` com `!cancelled()` + verificação de `result`
-- `set +e`/`set -e` nos health checks que podem falhar
+```
+push main/develop ──┬── changes (detecta paths)
+                    ├── test-backend     (src/**, pom.xml)
+                    ├── deploy-backend   (JAR → systemd restart)
+                    ├── deploy-frontend  (dist/ → nginx reload)
+                    │
+push tag v*    ────┬── test-backend
+                    ├── swarm-build     (Docker buildx multi-arch)
+                    ├── swarm-deploy    (stack deploy no cluster)
+                    └── scan            (Trivy vulnerability scan)
+
+workflow_dispatch ── Opções manuais:
+                       ☑ deploy_backend  ☑ deploy_frontend
+                       ☐ swarm_deploy    ☐ skip_tests
+```
+
+**Path detection:** o job `changes` usa `dorny/paths-filter` para detectar quais arquivos mudaram. Jobs só rodam se os paths relevantes foram alterados (ou se for `workflow_dispatch`).
 
 ### Secrets necessários no GitHub
 
-| Secret | Descrição |
-|--------|-----------|
-| `SSH_HOST` | IP/hostname do servidor |
-| `SSH_USER` | Usuário SSH (ex: `root`) |
+| Secret | Uso |
+|--------|-----|
+| `SSH_HOST` | IP/hostname do servidor de deploy |
+| `SSH_USER` | Usuário SSH (`root`) |
 | `SSH_PORT` | Porta SSH (default `22`) |
-| `SSH_PRIVATE_KEY` | Chave SSH privada para deploy |
-| `REGISTRY_USERNAME` | (Swarm) Usuário do Docker registry |
-| `REGISTRY_PASSWORD` | (Swarm) Senha do Docker registry |
-| `SWARM_STAGING_HOST` | (Swarm) Host do cluster staging |
-| `SWARM_STAGING_SSH_KEY` | (Swarm) Chave SSH staging |
-| `SWARM_PROD_HOST` | (Swarm) Host do cluster produção |
-| `SWARM_PROD_SSH_KEY` | (Swarm) Chave SSH produção |
+| `SSH_PRIVATE_KEY` | Chave SSH privada |
+| `VITE_API_URL` | URL base da API no frontend |
+| `REGISTRY_USERNAME` | (Swarm) Docker registry |
+| `REGISTRY_PASSWORD` | (Swarm) Docker registry |
+| `SWARM_PROD_HOST` | (Swarm) Host do cluster |
+| `SWARM_PROD_USER` | (Swarm) Usuário SSH |
+| `SWARM_PROD_SSH_KEY` | (Swarm) Chave SSH |
 
 ## Atenção: API do Spring 7.0
 
