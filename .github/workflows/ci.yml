@@ -22,6 +22,8 @@ jobs:
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          echo "PORT='$SSH_PORT'"
+          echo "PORT='$SSH_HOST'"
 
       - name: Deploy Swarm
         run: |
