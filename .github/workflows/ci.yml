@@ -16,22 +16,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ---- Build image in CI ----
+      - name: Build image
+        run: |
+          IMAGE_TAG="${GITHUB_SHA:0:8}"
+          IMAGE_NAME=$(echo "${GITHUB_REPOSITORY}" | cut -d'/' -f2)
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "IMAGE_NAME=$IMAGE_NAME" >> "$GITHUB_ENV"
+
+          docker build -t "$IMAGE_NAME:$IMAGE_TAG" .
+          docker save -o /tmp/image.tar "$IMAGE_NAME:$IMAGE_TAG"
+
+      # ---- SSH setup ----
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts
-          echo "PORT='$SSH_PORT'"
-          echo "PORT='$SSH_HOST'"
 
-      - name: Deploy Swarm
+      # ---- Upload artifacts + deploy stack ----
+      - name: Deploy
         run: |
-          REPO_NAME=$(echo "${GITHUB_REPOSITORY}" | cut -d'/' -f2)
+          REPO="${IMAGE_NAME}"
+          TAG="${IMAGE_TAG}"
           BRANCH="${GITHUB_REF#refs/heads/}"
-          IMAGE_TAG="${GITHUB_SHA:0:8}"
 
-          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -s "$REPO_NAME" "$BRANCH" "$IMAGE_TAG" "$GITHUB_REPOSITORY" << 'DEPLOY'
+          # Upload image tar + stack file to server
+          scp -i ~/.ssh/deploy_key -P "$SSH_PORT" \
+            /tmp/image.tar \
+            docker-stack.yml \
+            "$SSH_USER@$SSH_HOST:/tmp/"
+
+          # Deploy on server
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -s "$REPO" "$BRANCH" "$TAG" "$GITHUB_REPOSITORY" << 'DEPLOY'
             set -e
             REPO="$1"
             BRANCH="$2"
@@ -40,41 +58,43 @@ jobs:
 
             APP_DIR="$HOME/deploy/$REPO"
 
+            # Clone/pull repo (needed for docker-stack.yml configs)
             if [ ! -d "$APP_DIR" ]; then
               git clone "https://github.com/$GH_REPO.git" "$APP_DIR"
             fi
-
             cd "$APP_DIR"
-            git fetch origin
-            git checkout "$BRANCH"
-            git pull origin "$BRANCH"
+            git fetch origin && git checkout "$BRANCH" && git pull origin "$BRANCH"
 
-            echo "=== Building image: $REPO:$TAG ==="
-            docker build -t "$REPO:$TAG" .
+            # Load pre-built image from CI
+            echo "=== Loading image ==="
+            docker load -i /tmp/image.tar
+            rm -f /tmp/image.tar
 
+            # Deploy/update stack
             echo "=== Deploying stack ==="
             IMAGE_NAME="$REPO" IMAGE_TAG="$TAG" \
-              docker stack deploy -c docker-stack.yml "$REPO" --prune --resolve-image always
+              docker stack deploy -c /tmp/docker-stack.yml "$REPO" --prune --resolve-image always
+            rm -f /tmp/docker-stack.yml
 
+            # Wait and verify
             echo "=== Waiting for services ==="
             sleep 15
             docker stack services "$REPO"
 
-            echo "=== Health check ==="
             for i in 1 2 3 4 5; do
               STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health 2>/dev/null || echo "000")
-              echo "Attempt $i: HTTP $STATUS"
+              echo "Health $i: HTTP $STATUS"
               [ "$STATUS" = "200" ] && echo "✅ Deploy OK" && exit 0
               sleep 6
             done
 
-            echo "⚠️  Health check failed — service logs:"
+            echo "⚠️  Health check failed — logs:"
             docker service logs "${REPO}_gateway" --tail 30 || true
             exit 1
           DEPLOY
-        env:
-          GITHUB_REPOSITORY: ${{ github.repository }}
 
-      - name: Cleanup SSH key
+      - name: Cleanup
         if: always()
-        run: rm -f ~/.ssh/deploy_key
+        run: |
+          rm -f ~/.ssh/deploy_key
+          rm -f /tmp/image.tar
