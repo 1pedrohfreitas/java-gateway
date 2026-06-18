@@ -144,9 +144,30 @@ jobs:
         if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
           mkdir -p ~/.ssh
-          echo "$KEY" > ~/.ssh/deploy_key
+
+          # Validate key format
+          if ! echo "$KEY" | grep -q "PRIVATE KEY-----"; then
+            echo "❌ SSH key is invalid — missing BEGIN/END markers"
+            echo "   Ensure you copied the ENTIRE key including:"
+            echo "   -----BEGIN ... PRIVATE KEY-----"
+            echo "   ..."
+            echo "   -----END ... PRIVATE KEY-----"
+            exit 1
+          fi
+
+          # Write key preserving format (printf handles newlines correctly)
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts
+
+          # Verify key is readable by ssh
+          if ! ssh-keygen -l -f ~/.ssh/deploy_key >/dev/null 2>&1; then
+            echo "❌ SSH key is malformed or encrypted with passphrase"
+            echo "   Use an unencrypted key or generate a new one:"
+            echo "   ssh-keygen -t ed25519 -f deploy_key -N ''"
+            exit 1
+          fi
+
+          ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
           echo "✅ SSH configured for ${USER}@${HOST}:${PORT:-22}"
         env:
           HOST: ${{ secrets.SSH_HOST }}
@@ -157,7 +178,7 @@ jobs:
       - name: Prepare server
         if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
             "id -u api-gateway &>/dev/null || useradd -r -s /bin/false api-gateway; \
              mkdir -p /opt/api-gateway; chown -R api-gateway:api-gateway /opt/api-gateway"
           echo "✅ Server ready"
@@ -171,7 +192,7 @@ jobs:
         run: |
           JAR_FILE=$(ls target/api-gateway-*.jar | grep -v original | head -1)
           echo "Uploading: $JAR_FILE"
-          rsync -avz -e "ssh -i ~/.ssh/deploy_key -p ${PORT:-22}" \
+          rsync -avz -e "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p ${PORT:-22}" \
             "$JAR_FILE" "${USER}@${HOST}:/opt/api-gateway/api-gateway.jar"
           echo "✅ JAR uploaded"
         env:
@@ -182,10 +203,10 @@ jobs:
       - name: Restart service
         if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          scp -i ~/.ssh/deploy_key -P "${PORT:-22}" \
+          scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -P "${PORT:-22}" \
             deploy/api-gateway.service \
             "${USER}@${HOST}:/etc/systemd/system/api-gateway.service"
-          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
             "chown api-gateway:api-gateway /opt/api-gateway/api-gateway.jar && \
              systemctl daemon-reload && systemctl enable api-gateway && \
              (systemctl is-active --quiet api-gateway && systemctl restart api-gateway || systemctl start api-gateway)"
@@ -201,7 +222,7 @@ jobs:
           sleep 10
           for i in 1 2 3 4 5; do
             set +e
-            STATUS=$(ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
+            STATUS=$(ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
               "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health" 2>/dev/null) || STATUS="000"
             set -e
             echo "Attempt $i: HTTP $STATUS"
@@ -283,9 +304,21 @@ jobs:
         if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
           mkdir -p ~/.ssh
-          echo "$KEY" > ~/.ssh/deploy_key
+
+          if ! echo "$KEY" | grep -q "PRIVATE KEY-----"; then
+            echo "❌ SSH key is invalid — missing BEGIN/END markers"
+            exit 1
+          fi
+
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts
+
+          if ! ssh-keygen -l -f ~/.ssh/deploy_key >/dev/null 2>&1; then
+            echo "❌ SSH key is malformed or encrypted with passphrase"
+            exit 1
+          fi
+
+          ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
           echo "✅ SSH configured for ${USER}@${HOST}:${PORT:-22}"
         env:
           HOST: ${{ secrets.SSH_HOST }}
@@ -296,11 +329,11 @@ jobs:
       - name: Deploy files
         if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
             "mkdir -p /var/www/api-gateway-admin"
 
           rsync -avz --delete \
-            -e "ssh -i ~/.ssh/deploy_key -p ${PORT:-22}" \
+            -e "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p ${PORT:-22}" \
             dist/ "${USER}@${HOST}:/var/www/api-gateway-admin/"
           echo "✅ Files uploaded"
         env:
@@ -311,10 +344,10 @@ jobs:
       - name: Configure nginx
         if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
-          scp -i ~/.ssh/deploy_key -P "${PORT:-22}" \
+          scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -P "${PORT:-22}" \
             ../deploy/nginx-gateway-admin.conf \
             "${USER}@${HOST}:/etc/nginx/sites-available/api-gateway-admin"
-          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key -p "${PORT:-22}" "${USER}@${HOST}" \
             "command -v nginx || (apt-get update -qq && apt-get install -y -qq nginx); \
              ln -sf /etc/nginx/sites-available/api-gateway-admin /etc/nginx/sites-enabled/; \
              nginx -t && systemctl reload nginx"
