@@ -31,7 +31,7 @@ services:
           - node.role == manager
 
   gateway:
-    image: ${IMAGE_BACKEND:-api-gateway}:${IMAGE_TAG:-latest}
+    image: ghcr.io/1pedrohfreitas/java-gateway-backend:latest
     networks:
       - gateway-net
     environment:
@@ -48,7 +48,7 @@ services:
       timeout: 5s
       retries: 3
     deploy:
-      replicas: 2
+      replicas: 1
       restart_policy:
         condition: on-failure
       update_config:
@@ -58,11 +58,11 @@ services:
         failure_action: rollback
 
   frontend:
-    image: ${IMAGE_FRONTEND:-api-gateway-frontend}:${IMAGE_TAG:-latest}
+    image: ghcr.io/1pedrohfreitas/java-gateway-frontend:latest
     networks:
       - gateway-net
     ports:
-      - "80:80"
+      - "8089:80"
     depends_on:
       - gateway
     healthcheck:
