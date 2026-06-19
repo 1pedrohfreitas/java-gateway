@@ -46,8 +46,10 @@ jobs:
           docker build \
             -t "$IMAGE_NAME-backend:$IMAGE_TAG" \
             -t "${GHCR_BACKEND}" \
+            -t "${GHCR_BACKEND%:*}:latest" \
             .
           docker push "${GHCR_BACKEND}"
+          docker push "${GHCR_BACKEND%:*}:latest"
 
           # Save for downstream deploy job
           docker save -o /tmp/image-backend.tar "$IMAGE_NAME-backend:$IMAGE_TAG"
@@ -94,8 +96,10 @@ jobs:
           docker build \
             -t "$IMAGE_NAME-frontend:$IMAGE_TAG" \
             -t "${GHCR_FRONTEND}" \
+            -t "${GHCR_FRONTEND%:*}:latest" \
             frontend
           docker push "${GHCR_FRONTEND}"
+          docker push "${GHCR_FRONTEND%:*}:latest"
 
           # Save for downstream deploy job
           docker save -o /tmp/image-frontend.tar "$IMAGE_NAME-frontend:$IMAGE_TAG"
