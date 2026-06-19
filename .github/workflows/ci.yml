@@ -121,24 +121,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download backend image
-        uses: actions/download-artifact@v4
-        with:
-          name: image-backend
-          path: /tmp
-
-      - name: Download frontend image
-        uses: actions/download-artifact@v4
-        with:
-          name: image-frontend
-          path: /tmp
-
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          echo "HOST='$SSH_HOST'"
+          echo "PORT='$SSH_PORT'"
 
       - name: Deploy
         run: |
